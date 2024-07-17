@@ -83,7 +83,7 @@ class PolarityCount(EventRepresentation):
         self.voxel_grid = torch.zeros(
             (input_size), dtype=torch.float, requires_grad=False)
         self.nb_channels = input_size[0]
-
+##
     def convert(self, events):
         C, H, W = self.voxel_grid.shape
         with torch.no_grad():
