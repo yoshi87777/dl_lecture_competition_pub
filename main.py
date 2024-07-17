@@ -13,6 +13,12 @@ from pathlib import Path
 from typing import Dict, Any
 import os
 import time
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+
+
 
 
 class RepresentationType(Enum):
@@ -33,7 +39,9 @@ def compute_epe_error(pred_flow: torch.Tensor, gt_flow: torch.Tensor):
     pred_flow: torch.Tensor, Shape: torch.Size([B, 2, 480, 640]) => 予測したオプティカルフローデータ
     gt_flow: torch.Tensor, Shape: torch.Size([B, 2, 480, 640]) => 正解のオプティカルフローデータ
     '''
-    epe = torch.mean(torch.mean(torch.norm(pred_flow - gt_flow, p=2, dim=1), dim=(1, 2)), dim=0)
+    #epe = torch.mean(torch.mean(torch.norm(pred_flow - gt_flow, p=2, dim=1), dim=(1, 2)), dim=0)
+    gt_flow_resized = nn.functional.interpolate(gt_flow, size=(pred_flow.size(2), pred_flow.size(3)), mode='bilinear', align_corners=False)
+    epe = torch.mean(torch.norm(pred_flow - gt_flow_resized, p=2, dim=1))
     return epe
 
 def save_optical_flow_to_npy(flow: torch.Tensor, file_name: str):
@@ -43,6 +51,35 @@ def save_optical_flow_to_npy(flow: torch.Tensor, file_name: str):
     file_name: str => ファイル名
     '''
     np.save(f"{file_name}.npy", flow.cpu().numpy())
+
+
+####################################################################
+# multi_scale_loss関数の追加
+def multi_scale_loss(predictions, target):
+    losses = []
+    for prediction in predictions:
+        loss = compute_epe_error(prediction, target)
+        losses.append(loss)
+    return sum(losses)
+
+import os
+import torch
+
+def find_latest_checkpoint(checkpoint_dir):
+    checkpoint_files = [file for file in os.listdir(checkpoint_dir) if file.endswith('.pth')]
+    if not checkpoint_files:
+        return None
+    latest_file = max(checkpoint_files, key=lambda x: os.path.getctime(os.path.join(checkpoint_dir, x)))
+    return os.path.join(checkpoint_dir, latest_file)
+
+def load_checkpoint(model, optimizer, checkpoint_path):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    return checkpoint['epoch'], checkpoint['loss']
+
+####################################################################
 
 @hydra.main(version_base=None, config_path="configs", config_name="base")
 def main(args: DictConfig):
@@ -110,6 +147,11 @@ def main(args: DictConfig):
     # ------------------
     #       Model
     # ------------------
+
+    ################################################################################################################
+    #model_path = None
+    ################################################################################################################
+
     model = EVFlowNet(args.train).to(device)
 
     # ------------------
@@ -120,15 +162,50 @@ def main(args: DictConfig):
     #   Start training
     # ------------------
     model.train()
+
+    """checkpoint_dir = './checkpoints'  # チェックポイントのディレクトリを指定
+    latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
+    if latest_checkpoint:
+        start_epoch, last_loss = load_checkpoint(model, optimizer, latest_checkpoint)
+        start_epoch += 1  # 最後に保存されたエポックの次から開始
+        print(f"Resuming training from epoch {start_epoch} with loss {last_loss}")"""
+    
+    ####################################################################
+    #for epoch in range(start_epoch, args.train.epochs):
+    ####################################################################
     for epoch in range(args.train.epochs):
         total_loss = 0
         print("on epoch: {}".format(epoch+1))
         for i, batch in enumerate(tqdm(train_data)):
             batch: Dict[str, Any]
-            event_image = batch["event_volume"].to(device) # [B, 4, 480, 640]
-            ground_truth_flow = batch["flow_gt"].to(device) # [B, 2, 480, 640]
-            flow = model(event_image) # [B, 2, 480, 640]
-            loss: torch.Tensor = compute_epe_error(flow, ground_truth_flow)
+            #event_image = batch["event_volume"].to(device) # [B, 4, 480, 640]
+            #ground_truth_flow = batch["flow_gt"].to(device) # [B, 2, 480, 640]
+            #flow = model(event_image) # [B, 2, 480, 640]
+            #loss: torch.Tensor = compute_epe_error(flow, ground_truth_flow)
+            ####################################################################
+            
+            event_image_pair = batch["event_volume"]  # [2, B, 4, 480, 640]
+            ground_truth_flow = batch["flow_gt"].to(device)  # [B, 2, 480, 640]
+            ground_truth_flow = ground_truth_flow.squeeze(1)
+
+            #print(f'event_image_pair[0]: {event_image_pair[0].size()}')
+            #print(f'event_image_pair[1]: {event_image_pair[1].size()}')
+            #print(f"ground_truth_flow: {ground_truth_flow.size()}")
+
+            event_image_pair = [img.to(device) for img in event_image_pair]  # 各フレームをデバイスに移動
+
+            # モデルに渡すために連結
+            event_images = torch.cat(event_image_pair, dim=1)  # [B, 8, 480, 640] (4チャネル * 2フレーム)
+            
+          
+
+            flow_predictions = model(event_images)
+            #flow_predictions = model(event_image)
+            loss = multi_scale_loss(flow_predictions, ground_truth_flow)
+            ####################################################################
+            #modelが多重スケールの出力を返すようにEVFlowNetを変更する
+            
+            
             print(f"batch {i} loss: {loss.item()}")
             optimizer.zero_grad()
             loss.backward()
@@ -136,6 +213,16 @@ def main(args: DictConfig):
 
             total_loss += loss.item()
         print(f'Epoch {epoch+1}, Loss: {total_loss / len(train_data)}')
+        current_time = time.strftime("%Y%m%d%H%M%S")
+        model_path = f"checkpoints/model_epoch_{epoch + 1}_{current_time}.pth"
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': total_loss,
+        }, model_path)
+        #files.download(model_path)
+        print(f"Model checkpoint saved to {model_path}")
 
     # Create the directory if it doesn't exist
     if not os.path.exists('checkpoints'):
@@ -149,16 +236,33 @@ def main(args: DictConfig):
     # ------------------
     #   Start predicting
     # ------------------
+    ################################################################################################################
+    #if model_path is None:
+      #model_path = "/content/dl_lecture_competition_pub/checkpoints/model_20240714133025.pth"
+    ################################################################################################################
     model.load_state_dict(torch.load(model_path, map_location=device))
+    #print('model is gained')
     model.eval()
     flow: torch.Tensor = torch.tensor([]).to(device)
     with torch.no_grad():
         print("start test")
         for batch in tqdm(test_data):
             batch: Dict[str, Any]
-            event_image = batch["event_volume"].to(device)
-            batch_flow = model(event_image) # [1, 2, 480, 640]
-            flow = torch.cat((flow, batch_flow), dim=0)  # [N, 2, 480, 640]
+            #event_image = batch["event_volume"].to(device)
+            #batch_flow = model(event_image) # [1, 2, 480, 640]
+            #flow = torch.cat((flow, batch_flow), dim=0)  # [N, 2, 480, 640]
+            ################################################################################################################
+            event_image_pair = batch["event_volume"]  # [2, B, 4, 480, 640]
+            event_images = [img.to(device) for img in event_image_pair]  # 各フレームをデバイスに移動
+            event_images = torch.cat(event_images, dim=1)  # チャンネル次元で連結 [B, 8, 480, 640] torch.Size([1, 8, 480, 640]
+            #print(event_images.shape)#torch.Size([1, 8, 480, 640]
+            batch_flow = model(event_images)[-1]  # モデルに連結したイメージを入力
+            """for idx, flow in enumerate(batch_flow):
+              print(f"Shape of output {idx}: {flow.size()}")"""
+            flow = torch.cat((flow, batch_flow), dim=0)  # 結果を連結して全体のフローを構築       
+            ################################################################################################################
+        print(flow.shape)
+    
         print("test done")
     # ------------------
     #  save submission
@@ -168,3 +272,4 @@ def main(args: DictConfig):
 
 if __name__ == "__main__":
     main()
+
