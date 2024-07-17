@@ -56,7 +56,10 @@ class upsample_conv2d_and_predict_flow(nn.Module):
 
         flow = self.predict_flow(conv) * 256.
         
-        return torch.cat([conv,flow.clone()], dim=1), flow
+        #return torch.cat([conv,flow.clone()], dim=1), flow
+        ######################################################################
+        return conv, flow
+        ######################################################################
 
 def general_conv2d(in_channels,out_channels, ksize=3, strides=2, padding=1, do_batch_norm=False, activation='relu'):
     """
